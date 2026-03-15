@@ -1,3 +1,5 @@
+# app.py  —  URL Shortener API  (MTech Enhanced)
+
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from pymongo import MongoClient
@@ -25,11 +27,15 @@ SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey")
 BASE_URL   = os.getenv("BASE_URL", "http://localhost:5000")
 
 if not MONGO_URI:
-    raise Exception("MONGO_URI not found in environment variables")
+    raise Exception(
+        "\n\n  MONGO_URI is not set!\n"
+        "  Copy .env.example to .env and add your MongoDB connection string.\n"
+        "  See README.md for setup instructions.\n"
+    )
 
 # ----------- App -----------
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["http://localhost:3000", os.getenv("FRONTEND_URL", "")])
 
 # ----------- MongoDB -----------
 client           = MongoClient(MONGO_URI)
@@ -37,8 +43,26 @@ db               = client.url_shortener
 urls_collection  = db.urls
 users_collection = db.users
 
-# ----------- Bloom Filter (seeded from MongoDB at startup) -----------
+# ----------- Bloom Filter -----------
 bloom = build_bloom_filter(redis_client=None, db=db)
+
+# ----------- In-memory cache (replaces Redis for local dev) -----------
+_cache = {}
+
+def cache_get(key):
+    entry = _cache.get(key)
+    if entry is None:
+        return None
+    value, expires_at = entry
+    # respect expiry
+    if expires_at and datetime.datetime.utcnow() > expires_at:
+        del _cache[key]
+        return None
+    return value
+
+def cache_set(key, value, ex=None):
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(seconds=ex) if ex else None
+    _cache[key] = (value, expires_at)
 
 
 # ---------------------------------------------------------------------------
@@ -70,15 +94,6 @@ def _serialize(doc: dict) -> dict:
             out[k] = v
     return out
 
-_cache={}
-
-def redis_get(key):
-    return _cache.get(key)
-
-
-def redis_set(key, value, ex=None):
-    _cache[key]=value
-
 
 # ---------------------------------------------------------------------------
 # Auth decorators
@@ -107,11 +122,11 @@ def rate_limited(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         key   = f"rate:{request.user_email}:{datetime.date.today()}"
-        count = redis_get(key)
+        count = cache_get(key)
         count = int(count) if count else 0
         if count >= 10:
-            return jsonify({"error": "Daily URL shorten limit reached"}), 429
-        redis_set(key, count + 1, ex=86400)
+            return jsonify({"error": "Daily URL shorten limit reached (10/day)"}), 429
+        cache_set(key, count + 1, ex=86400)
         return f(*args, **kwargs)
     return decorated
 
@@ -125,15 +140,17 @@ def health_check():
     return jsonify({"status": "URL Shortener API is running"})
 
 
-# ── Auth ────────────────────────────────────────────────────────────────────
+# ── Register ─────────────────────────────────────────────────────────────────
 
 @app.route("/user/register", methods=["POST"])
 def register():
-    data     = request.get_json()
-    email    = data.get("email")
-    password = data.get("password")
+    data     = request.get_json() or {}
+    email    = data.get("email", "").strip().lower()
+    password = data.get("password", "")
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
     if users_collection.find_one({"email": email}):
         return jsonify({"error": "User already exists"}), 400
     hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
@@ -141,11 +158,13 @@ def register():
     return jsonify({"message": "User registered successfully"}), 201
 
 
+# ── Login ─────────────────────────────────────────────────────────────────────
+
 @app.route("/user/login", methods=["POST"])
 def login():
-    data     = request.get_json()
-    email    = data.get("email")
-    password = data.get("password")
+    data     = request.get_json() or {}
+    email    = data.get("email", "").strip().lower()
+    password = data.get("password", "")
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
     user = users_collection.find_one({"email": email})
@@ -162,9 +181,13 @@ def login():
     return jsonify({"access_token": access_token, "refresh_token": refresh_token})
 
 
+# ── Refresh token ─────────────────────────────────────────────────────────────
+
 @app.route("/user/refresh", methods=["POST"])
 def refresh():
     token = (request.get_json() or {}).get("refresh_token")
+    if not token:
+        return jsonify({"error": "Refresh token required"}), 400
     try:
         payload    = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
         new_access = jwt.encode(
@@ -179,20 +202,7 @@ def refresh():
         return jsonify({"error": "Invalid refresh token"}), 401
 
 
-# ── Shorten URL ──────────────────────────────────────────────────────────────
-#
-# Request body (JSON):
-#   long_url        string  required
-#   alias           string  optional — custom short code
-#   smart_alias     bool    optional — generate NLP alias from page title
-#   expires_in_days int     optional
-#   password        string  optional — protect the redirect
-#
-# Response (201):
-#   short_url       string  — full redirect URL
-#   short_code      string
-#   qr_code         string  — base64 PNG
-#   qr_data_uri     string  — data:image/png;base64,... (ready for <img src>)
+# ── Shorten URL ───────────────────────────────────────────────────────────────
 
 @app.route("/shorten", methods=["POST"])
 @token_required
@@ -210,13 +220,12 @@ def shorten_url():
     if not (long_url.startswith("http://") or long_url.startswith("https://")):
         return jsonify({"error": "long_url must start with http:// or https://"}), 400
 
-    # ── Determine short code ────────────────────────────────────────────────
+    # ── Determine short code ─────────────────────────────────────────────────
     if custom_alias:
         short_code = custom_alias
     elif smart_alias:
-        # NLP: fetch page title, extract keywords, build a readable slug
         short_code = generate_smart_alias(long_url, fetch_page=True)
-        # If the slug collides, append a 4-char hash suffix
+        # append 4-char suffix if alias already taken
         if bloom.exists(short_code) and urls_collection.find_one({"short_code": short_code}):
             suffix     = base64.urlsafe_b64encode(
                              hashlib.md5(long_url.encode()).digest()
@@ -225,14 +234,12 @@ def shorten_url():
     else:
         short_code = _make_short_code(long_url)
 
-    # ── Bloom filter collision check — O(1) ─────────────────────────────────
-    # False  → definitely new, skip DB query entirely
-    # True   → might exist, confirm with MongoDB (handles false positives)
+    # ── Bloom filter collision check — O(1) ──────────────────────────────────
     if bloom.exists(short_code):
         if urls_collection.find_one({"short_code": short_code}):
             return jsonify({"error": "Short code already exists. Use a custom alias."}), 400
 
-    # ── Persist ─────────────────────────────────────────────────────────────
+    # ── Persist ──────────────────────────────────────────────────────────────
     hashed_pw  = bcrypt.hashpw(password.encode(), bcrypt.gensalt()) if password else None
     expires_at = (
         datetime.datetime.utcnow() + datetime.timedelta(days=int(expires_in_days))
@@ -249,19 +256,19 @@ def shorten_url():
         "password":   hashed_pw,
         "flagged":    False,
     })
-    bloom.add(short_code)   # register in the filter
+    bloom.add(short_code)
 
     short_url = f"{BASE_URL}/r/{short_code}"
 
     return jsonify({
-        "short_url":    short_url,
-        "short_code":   short_code,
-        "qr_code":      generate_qr_code(short_url, as_base64=True),
-        "qr_data_uri":  generate_qr_data_uri(short_url),
+        "short_url":   short_url,
+        "short_code":  short_code,
+        "qr_code":     generate_qr_code(short_url, as_base64=True),
+        "qr_data_uri": generate_qr_data_uri(short_url),
     }), 201
 
 
-# ── Redirect ─────────────────────────────────────────────────────────────────
+# ── Redirect ──────────────────────────────────────────────────────────────────
 
 @app.route("/r/<short_code>")
 def redirect_url(short_code):
@@ -269,11 +276,11 @@ def redirect_url(short_code):
     if not bloom.exists(short_code):
         return jsonify({"error": "URL not found"}), 404
 
-    # Redis cache hit
-    cached = redis_get(short_code)
+    # In-memory cache hit
+    cached = cache_get(short_code)
     if cached:
-        _record_click(short_code, {})
-        return redirect(cached.decode() if isinstance(cached, bytes) else cached)
+        _record_click(short_code, {"ip": request.remote_addr, "timestamp": datetime.datetime.utcnow()})
+        return redirect(cached)
 
     url_doc = urls_collection.find_one({"short_code": short_code})
     if not url_doc:
@@ -305,7 +312,7 @@ def redirect_url(short_code):
 
     _record_click(short_code, geo_info)
 
-    # Anomaly check — flag the URL if suspicious, but still redirect the user
+    # Anomaly check — runs after redirect is recorded, flags if suspicious
     url_doc_fresh = urls_collection.find_one({"short_code": short_code})
     if url_doc_fresh:
         result = score_url_traffic(url_doc_fresh)
@@ -315,7 +322,8 @@ def redirect_url(short_code):
                 {"$set": {"flagged": True, "flag_reason": result["reason"]}}
             )
 
-    redis_set(short_code, url_doc["long_url"], ex=86400)
+    # Cache for 24 hours
+    cache_set(short_code, url_doc["long_url"], ex=86400)
     return redirect(url_doc["long_url"])
 
 
@@ -326,10 +334,7 @@ def _record_click(short_code: str, geo_info: dict):
     )
 
 
-# ── QR Code endpoint ─────────────────────────────────────────────────────────
-#
-# Returns the QR code as a PNG image stream.
-# Usage in an <img> tag:   <img src="/qr/abc123">
+# ── QR Code endpoint ──────────────────────────────────────────────────────────
 
 @app.route("/qr/<short_code>")
 def qr_endpoint(short_code):
@@ -339,7 +344,7 @@ def qr_endpoint(short_code):
     return make_qr_response(f"{BASE_URL}/r/{short_code}")
 
 
-# ── Analytics (owner only) — now includes ML report ──────────────────────────
+# ── Analytics ─────────────────────────────────────────────────────────────────
 
 @app.route("/analytics/<short_code>")
 @token_required
@@ -359,7 +364,6 @@ def analytics(short_code):
         "flagged":    url_doc.get("flagged", False),
         "metadata":   url_doc.get("metadata", []),
     })
-    # Attach ML analytics block
     base["ml_analytics"] = full_analytics_report(url_doc)
     return jsonify(base)
 
@@ -381,7 +385,7 @@ def dashboard():
     return jsonify({"top_countries": top_countries, "top_urls": top_urls})
 
 
-# ── Bloom filter debug stats ───────────────────────────────────────────────────
+# ── Bloom filter debug ────────────────────────────────────────────────────────
 
 @app.route("/debug/bloom")
 @token_required
@@ -420,4 +424,5 @@ scheduler.start()
 # ===========================================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
