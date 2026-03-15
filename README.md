@@ -290,6 +290,3 @@ FRONTEND_URL=http://localhost:3000
 
 ---
 
-## License
-
-MIT License — free to use for academic and personal projects.
