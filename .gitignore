@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+models/
+*.joblib
+venv/
+.venv/
+env/
+url-shortener-frontend/node_modules/
+url-shortener-frontend/build/
