@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: url-shortener
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
