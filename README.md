@@ -289,4 +289,8 @@ FRONTEND_URL=http://localhost:3000
 ```
 
 ---
-
+## Results
+![Output](https://raw.githubusercontent.com/aRPIT0313/images/main/url/login_home.png)
+![Output](https://raw.githubusercontent.com/aRPIT0313/images/main/url/home.png)
+![Output](https://raw.githubusercontent.com/aRPIT0313/images/main/url/url.png)
+![Output](https://raw.githubusercontent.com/aRPIT0313/images/main/url/dash1.png)
